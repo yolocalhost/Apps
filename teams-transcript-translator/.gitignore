@@ -1,0 +1,20 @@
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+
+.env
+.env.*
+!.env.example
+names.txt
+
+# Local model and runtime data
+models/
+*.gguf
+*.safetensors
+*.mlx
+
+# Captured or exported session data
+transcripts/
+screenshots/
+exports/

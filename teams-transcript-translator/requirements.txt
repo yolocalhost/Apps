@@ -1,0 +1,4 @@
+mlx
+mlx-lm==0.30.4
+pyobjc-framework-Quartz
+pyobjc-framework-Vision
