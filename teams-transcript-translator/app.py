@@ -41,6 +41,7 @@ MODEL_PATH = Path(
 NAMES_PATH = Path(__file__).with_name("names.txt")
 TRANSCRIPTS_PATH = Path(__file__).with_name("transcripts")
 KNOWN_WORDS_PATH = Path(__file__).with_name("known_words.txt")
+VOCABULARY_TRANSLATIONS_PATH = Path(__file__).with_name("vocabulary_translations.txt")
 SCAN_INTERVAL = 1.0
 VOCABULARY_LIMIT = 20
 WORD_PATTERN = re.compile(r"[A-Za-zÀ-ž]+(?:['’-][A-Za-zÀ-ž]+)?")
@@ -70,7 +71,9 @@ STOPWORDS = {
 events = queue.Queue()
 translation_requests = queue.Queue()
 translation_worker_lock = threading.Lock()
+vocabulary_translation_lock = threading.Lock()
 translation_worker = None
+vocabulary_translations = {}
 state = {
     "running": False,
     "region": None,
@@ -120,6 +123,40 @@ def save_known_word(source_language, word, path=KNOWN_WORDS_PATH):
     with path.open("a", encoding="utf-8") as known_file:
         known_file.write(f"{key[0]}\t{key[1]}\n")
     return True
+
+
+def load_vocabulary_translations(path=VOCABULARY_TRANSLATIONS_PATH):
+    if not path.exists():
+        return {}
+
+    translations = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        language, separator, rest = line.partition("\t")
+        word, separator, translation = rest.partition("\t")
+        word = word.strip().casefold()
+        translation = translation.strip()
+        if separator and language in STOPWORDS and word and translation:
+            translations[(language, word)] = translation
+    return translations
+
+
+def save_vocabulary_translation(source_language, word, translation):
+    key = (source_language, word.casefold().strip())
+    translation = translation.strip().replace("\t", " ")
+    if not key[1] or not translation:
+        return False
+
+    with vocabulary_translation_lock:
+        if key in vocabulary_translations:
+            return False
+        VOCABULARY_TRANSLATIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with VOCABULARY_TRANSLATIONS_PATH.open("a", encoding="utf-8") as translations_file:
+            translations_file.write(f"{key[0]}\t{key[1]}\t{translation}\n")
+        vocabulary_translations[key] = translation
+    return True
+
+
+vocabulary_translations.update(load_vocabulary_translations())
 
 
 def select_region(root, callback):
@@ -230,6 +267,37 @@ def normalize_line(line):
     return clean
 
 
+def canonical_speaker_label(line, names):
+    clean = normalize_line(line)
+    if not clean:
+        return ""
+
+    timestamp_match = re.match(
+        r"^(?P<prefix>\d{1,2}:\d{2}(?::\d{2})?\s+)?(?P<label>.+)$",
+        clean,
+    )
+    prefix = timestamp_match.group("prefix") or ""
+    label = timestamp_match.group("label")
+    folded_label = label.casefold()
+    for name in names:
+        folded_name = name.casefold()
+        if folded_label == folded_name:
+            return prefix + name
+        if folded_label.startswith(folded_name + " "):
+            suffix = label[len(name):].strip()
+            if re.fullmatch(r"\d{3,8}(?:\s+[A-Za-z]{2,6})?", suffix):
+                return f"{prefix}{name} {suffix}"
+            return prefix + name
+
+    if re.fullmatch(
+        r"[A-Za-zÀ-ž][A-Za-zÀ-ž.'-]*(?:\s+[A-Za-zÀ-ž][A-Za-zÀ-ž.'-]*){1,4}"
+        r"\s+\d{3,8}(?:\s+[A-Za-zÀ-ž]{2,6})?",
+        label,
+    ):
+        return clean
+    return ""
+
+
 def comparable_line(line):
     return re.sub(r"[^\wÀ-ž]+", " ", line.casefold()).strip()
 
@@ -277,14 +345,15 @@ def upsert_ocr_line(line, source_language, names, speaker_context=None):
     if not clean:
         return None
 
-    if is_speaker_label(clean, names):
-        speaker_context = clean
-        state["current_speaker"] = clean
+    speaker_label = canonical_speaker_label(clean, names)
+    if speaker_label:
+        speaker_context = speaker_label
+        state["current_speaker"] = speaker_label
         state["active_entry_id"] = None
         for entry in reversed(state["entries"][-40:]):
-            if entry["speaker"] and comparable_line(entry["source"]) == comparable_line(clean):
+            if entry["speaker"] and comparable_line(entry["source"]) == comparable_line(speaker_label):
                 return None
-        return add_entry(clean, clean, True, clean)
+        return add_entry(speaker_label, speaker_label, True, speaker_label)
 
     speaker = (
         state["current_speaker"]
@@ -317,8 +386,9 @@ def process_ocr_lines(lines, source_language, names):
         clean = normalize_line(line)
         if not clean:
             continue
-        if is_speaker_label(clean, names):
-            scan_speaker = clean
+        speaker_label = canonical_speaker_label(clean, names)
+        if speaker_label:
+            scan_speaker = speaker_label
         event = upsert_ocr_line(
             clean,
             source_language,
@@ -345,22 +415,7 @@ def split_speaker(line):
 
 
 def is_speaker_label(line, names):
-    clean = normalize_line(line)
-    without_timestamp = re.sub(r"^\d{1,2}:\d{2}(?::\d{2})?\s+", "", clean)
-    if any(
-        without_timestamp.casefold() == name.casefold()
-        or without_timestamp.casefold().startswith(name.casefold() + " ")
-        for name in names
-    ):
-        return True
-
-    return bool(
-        re.fullmatch(
-            r"[A-Za-zÀ-ž][A-Za-zÀ-ž.'-]*(?:\s+[A-Za-zÀ-ž][A-Za-zÀ-ž.'-]*){1,4}"
-            r"\s+\d{3,8}(?:\s+[A-Za-zÀ-ž]{2,6})?",
-            without_timestamp,
-        )
-    )
+    return bool(canonical_speaker_label(line, names))
 
 
 def available_transcripts(root=TRANSCRIPTS_PATH):
@@ -385,9 +440,11 @@ def load_transcript_entries(path, names):
         if not clean:
             continue
 
-        speaker = is_speaker_label(clean, names)
+        speaker_label = canonical_speaker_label(clean, names)
+        speaker = bool(speaker_label)
         if speaker:
-            current_speaker = clean
+            clean = speaker_label
+            current_speaker = speaker_label
         entries.append(
             {
                 "source": clean,
@@ -521,8 +578,9 @@ def translate_text(text, source_language):
 
 
 def translate_line(line, source_language, names):
-    if is_speaker_label(line, names):
-        return line
+    speaker_label = canonical_speaker_label(line, names)
+    if speaker_label:
+        return speaker_label
     prefix, body = split_speaker(line)
     protected, replacements = protect_names(body, names)
     translated = translate_text(protected, source_language)
@@ -571,12 +629,18 @@ def frequent_words(
 def translate_vocabulary(words, source_language, request_id):
     try:
         for index, (word, _count) in enumerate(words):
+            key = (source_language, word.casefold().strip())
+            with vocabulary_translation_lock:
+                translation = vocabulary_translations.get(key)
+            if translation is None:
+                translation = translate_text(word, source_language)
+                save_vocabulary_translation(source_language, word, translation)
             events.put(
                 (
                     "vocabulary-row",
                     request_id,
                     index,
-                    translate_text(word, source_language),
+                    translation,
                 )
             )
     except Exception as exc:

@@ -32,6 +32,8 @@ Do not create tests, test files, test frameworks, fixtures, or coverage configur
 
 This checkout has no available Git history to establish an existing convention. Use short, imperative commit subjects such as `Improve OCR line matching`, and keep each commit focused. Pull requests should explain the behavior change, list manual verification, note dependency or permission changes, and include a screenshot only when the UI changed. Never commit transcripts, screenshots containing sensitive text, model files, credentials, or local environment directories.
 
+After every repository change, run the relevant verification, commit all intended source and documentation changes with a short imperative subject, and push the commit to the configured Git remote. Never include generated or local runtime data such as `known_words.txt` or `vocabulary_translations.txt`.
+
 ## Security and Configuration
 
 Keep the application local-only. Do not add remote upload or telemetry behavior without an explicit requirement. Treat captured transcript text, speaker names, and model paths as potentially sensitive.
