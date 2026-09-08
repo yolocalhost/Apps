@@ -766,7 +766,7 @@ def build_ui():
     ))
     stop_button.pack(side="left", padx=6)
     learn_button = ttk.Button(
-        toolbar, text="Learn words", state="disabled", command=lambda: open_vocabulary()
+        toolbar, text="Learn words", command=lambda: open_vocabulary()
     )
     learn_button.pack(side="left")
     ttk.Label(toolbar, textvariable=region_var).pack(side="left", padx=8)

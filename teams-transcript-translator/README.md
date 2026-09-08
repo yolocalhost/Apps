@@ -29,7 +29,7 @@ Set `TEAMS_TRANSLATOR_MODEL_PATH` before starting the app to use a different mod
 3. Click `Start`.
 4. The left panel shows OCR input and the right panel shows the Slovak translation.
 5. Add speaker or other names to `names.txt`, one name per line.
-6. After stopping, click `Learn words` to see the most frequent transcript words and their Slovak translations. Common helper words, names, and words already marked as known are omitted.
+6. When OCR is stopped, click `Learn words` to see the most frequent transcript words and their Slovak translations. This is available when the app opens, so you can choose an older saved session before starting a new scan. Common helper words, names, and words already marked as known are omitted.
 7. In `Session words`, choose `Aktuálna session` or an older saved transcript, select the input language, and click `Už viem` after selecting words you already know. The known-word list is stored locally in `known_words.txt` and is reused in future sessions. Completed vocabulary translations are cached in `vocabulary_translations.txt`, so refreshing the list does not translate the same word again.
 
 When the app is closed, the current transcript is saved automatically as two UTF-8 text files: one original and one Slovak translation. Files are stored under `transcripts/YYYY/MM/DD/` with a time-based filename.
