@@ -85,6 +85,7 @@ state = {
     "model": None,
     "tokenizer": None,
     "source_language": "English",
+    "transcript_saved": False,
 }
 
 
@@ -517,6 +518,16 @@ def save_transcript(entries, root=TRANSCRIPTS_PATH, saved_at=None):
     return original_path, translation_path
 
 
+def save_current_transcript():
+    if state["transcript_saved"]:
+        return None
+
+    saved_paths = save_transcript(state["entries"])
+    if saved_paths is not None:
+        state["transcript_saved"] = True
+    return saved_paths
+
+
 def protect_names(text, names):
     replacements = {}
     protected = text
@@ -703,6 +714,7 @@ def start_capture(source_var, status_var, start_button, stop_button, learn_butto
     state["running"] = True
     state["source_language"] = source_var.get()
     state["entries"].clear()
+    state["transcript_saved"] = False
     state["next_entry_id"] = 0
     state["active_entry_id"] = None
     state["current_speaker"] = ""
@@ -717,7 +729,13 @@ def start_capture(source_var, status_var, start_button, stop_button, learn_butto
 
 def stop_capture(status_var, start_button, stop_button, learn_button):
     state["running"] = False
-    status_var.set("Zastavené")
+    try:
+        saved_paths = save_current_transcript()
+    except Exception as exc:
+        status_var.set("Zastavené - uloženie zlyhalo")
+        messagebox.showerror("Uloženie transcriptu", str(exc))
+    else:
+        status_var.set("Transcript uložený." if saved_paths else "Zastavené - nič na uloženie.")
     start_button.configure(state="normal")
     stop_button.configure(state="disabled")
     learn_button.configure(state="normal")
@@ -1039,7 +1057,7 @@ def build_ui():
     def close():
         state["running"] = False
         try:
-            save_transcript(state["entries"])
+            save_current_transcript()
         except Exception as exc:
             messagebox.showerror("Uloženie transcriptu", str(exc))
         root.destroy()
