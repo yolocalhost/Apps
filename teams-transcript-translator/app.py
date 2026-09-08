@@ -80,6 +80,7 @@ state = {
     "entries": [],
     "next_entry_id": 0,
     "active_entry_id": None,
+    "revision_entry_id": None,
     "current_speaker": "",
     "model": None,
     "tokenizer": None,
@@ -317,12 +318,24 @@ def line_revision(old_line, new_line):
 
 
 def find_live_entry(line, speaker):
+    comparable = comparable_line(line)
     for entry in reversed(state["entries"][-40:]):
         if entry["speaker"] or entry["context"] != speaker:
             continue
-        revision = line_revision(entry["source"], line)
-        if revision != "different":
-            return entry, revision
+        if comparable_line(entry["source"]) == comparable:
+            return entry, "same"
+
+    revision_entry_id = state.get("revision_entry_id")
+    if revision_entry_id is not None:
+        for entry in reversed(state["entries"][-40:]):
+            if (
+                entry["id"] == revision_entry_id
+                and not entry["speaker"]
+                and entry["context"] == speaker
+            ):
+                revision = line_revision(entry["source"], line)
+                if revision in ("longer", "shorter"):
+                    return entry, revision
     return None, "different"
 
 
@@ -337,7 +350,7 @@ def add_entry(source, translation, speaker, context):
     state["next_entry_id"] += 1
     state["entries"].append(entry)
     state["active_entry_id"] = entry["id"]
-    return ("upsert", entry["id"], source, translation, speaker)
+    return ("upsert", entry["id"], source, translation, speaker, context)
 
 
 def upsert_ocr_line(line, source_language, names, speaker_context=None):
@@ -373,6 +386,7 @@ def upsert_ocr_line(line, source_language, names, speaker_context=None):
             entry["source"],
             entry["translation"],
             False,
+            entry["context"],
         )
 
     translated = translate_line(clean, source_language, names)
@@ -380,8 +394,8 @@ def upsert_ocr_line(line, source_language, names, speaker_context=None):
 
 
 def process_ocr_lines(lines, source_language, names):
-    scan_speaker = ""
-    state["current_speaker"] = ""
+    state["revision_entry_id"] = state["active_entry_id"]
+    scan_speaker = state["current_speaker"]
     for line in lines:
         clean = normalize_line(line)
         if not clean:
@@ -458,12 +472,22 @@ def load_transcript_entries(path, names):
 
 def transcript_text(entries, field):
     lines = []
+    displayed_speaker = ""
     for entry in entries:
         value = entry.get(field, "").strip()
         if not value:
             continue
         if entry.get("speaker") and lines:
             lines.append("")
+        if entry.get("speaker"):
+            displayed_speaker = entry.get("context") or value
+        else:
+            context = entry.get("context", "")
+            if context and context != displayed_speaker:
+                if lines:
+                    lines.append("")
+                lines.append(context)
+                displayed_speaker = context
         lines.append(value)
     return "\n".join(lines).strip() + "\n" if lines else ""
 
@@ -682,6 +706,7 @@ def start_capture(source_var, status_var, start_button, stop_button, learn_butto
     state["next_entry_id"] = 0
     state["active_entry_id"] = None
     state["current_speaker"] = ""
+    state["revision_entry_id"] = None
     events.put(("reset",))
     status_var.set("Spúšťam OCR...")
     start_button.configure(state="disabled")
@@ -931,16 +956,26 @@ def build_ui():
             box.configure(state="normal")
             box.delete("1.0", "end")
 
+        displayed_speaker = ""
         for index, entry in enumerate(ui_entries):
-            if entry["speaker"] and index:
-                input_box.insert("end", "\n")
-                output_box.insert("end", "\n")
             if entry["speaker"]:
+                if index:
+                    input_box.insert("end", "\n")
+                    output_box.insert("end", "\n")
                 input_box.insert("end", entry["source"] + "\n", "speaker")
                 output_box.insert("end", entry["translation"] + "\n", "speaker")
-            else:
-                input_box.insert("end", "  " + entry["source"] + "\n")
-                output_box.insert("end", "  " + entry["translation"] + "\n")
+                displayed_speaker = entry["source"]
+                continue
+
+            context = entry.get("context", "")
+            if context and context != displayed_speaker:
+                input_box.insert("end", "\n")
+                output_box.insert("end", "\n")
+                input_box.insert("end", context + "\n", "speaker")
+                output_box.insert("end", context + "\n", "speaker")
+                displayed_speaker = context
+            input_box.insert("end", "  " + entry["source"] + "\n")
+            output_box.insert("end", "  " + entry["translation"] + "\n")
 
         for box in (input_box, output_box):
             box.see("end")
@@ -957,12 +992,13 @@ def build_ui():
                     ui_indexes.clear()
                     render_entries()
                 elif event[0] == "upsert":
-                    entry_id, source, translation, speaker = event[1:]
+                    entry_id, source, translation, speaker, context = event[1:]
                     entry = {
                         "id": entry_id,
                         "source": source,
                         "translation": translation,
                         "speaker": speaker,
+                        "context": context,
                     }
                     if entry_id in ui_indexes:
                         ui_entries[ui_indexes[entry_id]] = entry

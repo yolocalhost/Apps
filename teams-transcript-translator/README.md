@@ -36,7 +36,9 @@ When the app is closed, the current transcript is saved automatically as two UTF
 
 The `English` and `German` input selector can be changed while OCR is running. The next screen scan uses the selected language.
 
-Speaker context is taken from names visible in the current scan. If the selected area starts in the middle of a message, that first fragment is left without a speaker until the next speaker name is recognized.
+Speaker context is taken from names visible in the current scan and retained between scans. If the selected area starts in the middle of a message and no previous speaker is known, that first fragment remains without a speaker until a name is recognized.
+
+When a speaker returns after another speaker, the speaker heading is shown again. This keeps a short utterance from absorbing the next speaker's text.
 
 Names from `names.txt` are kept as the canonical speaker labels. OCR characters picked up from a Teams badge or other icon after a known name are discarded; numeric Teams suffixes are kept.
 
