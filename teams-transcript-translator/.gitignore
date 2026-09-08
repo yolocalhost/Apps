@@ -8,6 +8,7 @@ __pycache__/
 !.env.example
 names.txt
 known_words.txt
+vocabulary_translations.txt
 
 # Local model and runtime data
 models/
