@@ -46,6 +46,8 @@ SCAN_INTERVAL = 1.0
 VOCABULARY_LIMIT = 20
 WORD_PATTERN = re.compile(r"[A-Za-zÀ-ž]+(?:['’-][A-Za-zÀ-ž]+)?")
 OCR_TEXT_PATTERN = re.compile(r"[A-Za-zÀ-ž]{2,}")
+COMPARABLE_WORD_PATTERN = re.compile(r"[A-Za-zÀ-ž0-9]+")
+MIN_OCR_OVERLAP_WORDS = 3
 STOPWORDS = {
     "English": frozenset(
         (
@@ -304,6 +306,34 @@ def comparable_line(line):
     return re.sub(r"[^\wÀ-ž]+", " ", line.casefold()).strip()
 
 
+def comparable_words(line):
+    return COMPARABLE_WORD_PATTERN.findall(line.casefold())
+
+
+def contains_word_sequence(container, candidate):
+    if not candidate or len(candidate) > len(container):
+        return False
+    size = len(candidate)
+    return any(
+        container[index : index + size] == candidate
+        for index in range(len(container) - size + 1)
+    )
+
+
+def boundary_overlap(left_words, right_words):
+    for size in range(min(len(left_words), len(right_words)), 0, -1):
+        if left_words[-size:] == right_words[:size]:
+            return size, "right"
+        if right_words[-size:] == left_words[:size]:
+            return size, "left"
+    return 0, ""
+
+
+def meaningful_overlap(left_words, right_words, overlap):
+    shorter = min(len(left_words), len(right_words))
+    return overlap >= MIN_OCR_OVERLAP_WORDS and overlap * 3 >= shorter
+
+
 def line_revision(old_line, new_line):
     old_value = comparable_line(old_line)
     new_value = comparable_line(new_line)
@@ -315,12 +345,109 @@ def line_revision(old_line, new_line):
         return "longer"
     if old_value.startswith(new_value):
         return "shorter"
+    old_words = comparable_words(old_line)
+    new_words = comparable_words(new_line)
+    if contains_word_sequence(new_words, old_words):
+        return "longer"
+    if contains_word_sequence(old_words, new_words):
+        return "shorter"
+    overlap, _direction = boundary_overlap(old_words, new_words)
+    if meaningful_overlap(old_words, new_words, overlap):
+        return "overlap"
     return "different"
+
+
+def text_after_words(text, count):
+    matches = list(COMPARABLE_WORD_PATTERN.finditer(text))
+    if count >= len(matches):
+        return ""
+    return text[matches[count].start() :].strip()
+
+
+def strip_join_punctuation(text):
+    return re.sub(r"[\s,.;:!?]+$", "", text).strip()
+
+
+def merge_ocr_text(old_line, new_line):
+    old_clean = normalize_line(old_line)
+    new_clean = normalize_line(new_line)
+    revision = line_revision(old_clean, new_clean)
+    if revision == "longer":
+        return new_clean
+    if revision in ("same", "shorter"):
+        return old_clean
+
+    old_words = comparable_words(old_clean)
+    new_words = comparable_words(new_clean)
+    overlap, direction = boundary_overlap(old_words, new_words)
+    if not meaningful_overlap(old_words, new_words, overlap):
+        return new_clean
+
+    if direction == "right":
+        tail = text_after_words(new_clean, overlap)
+        if not tail:
+            return old_clean
+        return f"{old_clean} {tail}".strip()
+
+    tail = text_after_words(old_clean, overlap)
+    if not tail:
+        return new_clean
+    return f"{new_clean} {tail}".strip()
+
+
+def merge_ocr_fragments(lines):
+    merged = []
+    for line in lines:
+        clean = normalize_line(line)
+        if not clean:
+            continue
+
+        words = comparable_words(clean)
+        if not merged:
+            merged.append(clean)
+            continue
+
+        previous = merged[-1]
+        previous_words = comparable_words(previous)
+        revision = line_revision(previous, clean)
+        if revision == "same":
+            continue
+        if revision == "longer":
+            merged[-1] = clean
+            continue
+        if (
+            revision == "shorter"
+            and (
+                comparable_line(previous).startswith(comparable_line(clean))
+                or previous_words[: len(words)] == words
+                or previous_words[-len(words) :] == words
+            )
+        ):
+            continue
+        if revision == "overlap":
+            merged[-1] = merge_ocr_text(merged[-1], clean)
+            continue
+
+        overlap, direction = boundary_overlap(previous_words, words)
+        if (
+            direction == "right"
+            and overlap == 1
+            and len(previous_words) <= 4
+            and len(words) > 1
+            and not re.search(r"[.!?]$", previous)
+        ):
+            tail = text_after_words(clean, overlap)
+            merged[-1] = f"{strip_join_punctuation(previous)} {tail}".strip()
+        else:
+            merged.append(clean)
+
+    return " ".join(merged)
 
 
 def find_live_entry(line, speaker):
     comparable = comparable_line(line)
-    for entry in reversed(state["entries"][-40:]):
+    recent_entries = list(reversed(state["entries"][-40:]))
+    for entry in recent_entries:
         if entry["speaker"] or entry["context"] != speaker:
             continue
         if comparable_line(entry["source"]) == comparable:
@@ -328,15 +455,23 @@ def find_live_entry(line, speaker):
 
     revision_entry_id = state.get("revision_entry_id")
     if revision_entry_id is not None:
-        for entry in reversed(state["entries"][-40:]):
+        for entry in recent_entries:
             if (
                 entry["id"] == revision_entry_id
                 and not entry["speaker"]
                 and entry["context"] == speaker
             ):
                 revision = line_revision(entry["source"], line)
-                if revision in ("longer", "shorter"):
+                if revision in ("longer", "shorter", "overlap"):
                     return entry, revision
+
+    for entry in recent_entries:
+        if entry["speaker"] or entry["context"] != speaker:
+            continue
+        revision = line_revision(entry["source"], line)
+        if revision in ("longer", "overlap"):
+            return entry, revision
+        break
     return None, "different"
 
 
@@ -379,8 +514,9 @@ def upsert_ocr_line(line, source_language, names, speaker_context=None):
         state["active_entry_id"] = entry["id"]
         if revision in ("same", "shorter"):
             return None
-        entry["source"] = clean
-        entry["translation"] = translate_line(clean, source_language, names)
+        source = merge_ocr_text(entry["source"], clean)
+        entry["source"] = source
+        entry["translation"] = translate_line(source, source_language, names)
         return (
             "upsert",
             entry["id"],
@@ -397,21 +533,42 @@ def upsert_ocr_line(line, source_language, names, speaker_context=None):
 def process_ocr_lines(lines, source_language, names):
     state["revision_entry_id"] = state["active_entry_id"]
     scan_speaker = state["current_speaker"]
-    for line in lines:
-        clean = normalize_line(line)
-        if not clean:
-            continue
-        speaker_label = canonical_speaker_label(clean, names)
-        if speaker_label:
-            scan_speaker = speaker_label
+    text_lines = []
+
+    def flush_text():
+        nonlocal text_lines
+        text = merge_ocr_fragments(text_lines)
+        text_lines = []
+        if not text:
+            return
         event = upsert_ocr_line(
-            clean,
+            text,
             source_language,
             names,
             speaker_context=scan_speaker,
         )
         if event is not None:
             events.put(event)
+
+    for line in lines:
+        clean = normalize_line(line)
+        if not clean:
+            continue
+        speaker_label = canonical_speaker_label(clean, names)
+        if speaker_label:
+            flush_text()
+            scan_speaker = speaker_label
+            event = upsert_ocr_line(
+                clean,
+                source_language,
+                names,
+                speaker_context=scan_speaker,
+            )
+            if event is not None:
+                events.put(event)
+        else:
+            text_lines.append(clean)
+    flush_text()
 
 
 def split_speaker(line):
