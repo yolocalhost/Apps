@@ -88,21 +88,48 @@ state = {
     "tokenizer": None,
     "source_language": "English",
     "transcript_saved": False,
+    "names": [],
+    "saved_names": [],
+    "names_dirty": False,
 }
+
+
+def normalize_names(lines):
+    names = []
+    seen = set()
+    for line in lines:
+        name = line.strip()
+        key = name.casefold()
+        if not name or name.lstrip().startswith("#") or key in seen:
+            continue
+        seen.add(key)
+        names.append(name)
+    return sorted(names, key=len, reverse=True)
 
 
 def load_names():
     if not NAMES_PATH.exists():
         return []
-    return sorted(
-        [
-            line.strip()
-            for line in NAMES_PATH.read_text(encoding="utf-8").splitlines()
-            if line.strip() and not line.lstrip().startswith("#")
-        ],
-        key=len,
-        reverse=True,
-    )
+    return normalize_names(NAMES_PATH.read_text(encoding="utf-8").splitlines())
+
+
+def save_names(names):
+    normalized = normalize_names(names)
+    contents = "\n".join(normalized)
+    if contents:
+        contents += "\n"
+    NAMES_PATH.write_text(contents, encoding="utf-8")
+
+
+def save_pending_names():
+    if not state["names_dirty"]:
+        return False
+    names = normalize_names(state["names"])
+    save_names(names)
+    state["names"] = names
+    state["saved_names"] = list(names)
+    state["names_dirty"] = False
+    return True
 
 
 def load_known_words(path=KNOWN_WORDS_PATH):
@@ -842,13 +869,13 @@ def translate_vocabulary(words, source_language, request_id):
 
 
 def capture_loop():
-    names = load_names()
     while state["running"]:
         started = time.monotonic()
         try:
             source_language = state["source_language"]
             image = capture_image(state["region"])
             lines = recognize_text(image, source_language)
+            names = tuple(state["names"])
             process_ocr_lines(lines, source_language, names)
             events.put(("status", "OCR beží"))
         except Exception as exc:
@@ -886,13 +913,26 @@ def start_capture(source_var, status_var, start_button, stop_button, learn_butto
 
 def stop_capture(status_var, start_button, stop_button, learn_button):
     state["running"] = False
+    errors = []
+    names_saved = False
+    try:
+        names_saved = save_pending_names()
+    except Exception as exc:
+        errors.append(f"Participants: {exc}")
     try:
         saved_paths = save_current_transcript()
     except Exception as exc:
+        errors.append(f"Transcript: {exc}")
+    if errors:
         status_var.set("Zastavené - uloženie zlyhalo")
-        messagebox.showerror("Uloženie transcriptu", str(exc))
+        messagebox.showerror("Uloženie zlyhalo", "\n".join(errors))
     else:
-        status_var.set("Transcript uložený." if saved_paths else "Zastavené - nič na uloženie.")
+        saved_messages = []
+        if names_saved:
+            saved_messages.append("Participants saved.")
+        if saved_paths:
+            saved_messages.append("Transcript uložený.")
+        status_var.set(" ".join(saved_messages) or "Zastavené - nič na uloženie.")
     start_button.configure(state="normal")
     stop_button.configure(state="disabled")
     learn_button.configure(state="normal")
@@ -903,6 +943,10 @@ def build_ui():
     root.title("Teams Transcript Translator")
     root.geometry("1100x650")
     root.minsize(800, 450)
+
+    state["names"] = load_names()
+    state["saved_names"] = list(state["names"])
+    state["names_dirty"] = False
 
     source_var = tk.StringVar(value="English")
     status_var = tk.StringVar(value="Vyber oblasť transcriptu.")
@@ -944,6 +988,9 @@ def build_ui():
         toolbar, text="Learn words", command=lambda: open_vocabulary()
     )
     learn_button.pack(side="left")
+    ttk.Button(
+        toolbar, text="Participants", command=lambda: open_participants()
+    ).pack(side="left", padx=(6, 0))
     ttk.Label(toolbar, textvariable=region_var).pack(side="left", padx=8)
     ttk.Label(toolbar, textvariable=status_var).pack(side="right")
 
@@ -965,6 +1012,53 @@ def build_ui():
     ui_entries = []
     ui_indexes = {}
     vocabulary = {"id": 0, "window": None, "tree": None, "items": []}
+    participants = {"window": None}
+
+    def open_participants():
+        existing = participants["window"]
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            return
+
+        window = tk.Toplevel(root)
+        participants["window"] = window
+        window.title("Edit participants")
+        window.geometry("460x400")
+        window.minsize(360, 280)
+        window.transient(root)
+
+        ttk.Label(
+            window,
+            text="Enter one participant per line. Changes during transcription are saved after Stop.",
+            wraplength=420,
+        ).pack(fill="x", padx=12, pady=(12, 6))
+        editor = scrolledtext.ScrolledText(window, wrap="word", height=14)
+        editor.pack(fill="both", expand=True, padx=12, pady=6)
+        editor.insert("1.0", "\n".join(state["names"]))
+
+        actions = ttk.Frame(window)
+        actions.pack(fill="x", padx=12, pady=(6, 12))
+        ttk.Button(actions, text="Cancel", command=window.destroy).pack(side="right")
+
+        def apply_participants():
+            names = normalize_names(editor.get("1.0", "end").splitlines())
+            state["names"] = names
+            state["names_dirty"] = names != state["saved_names"]
+            if state["running"]:
+                status_var.set("Participants updated; saved after Stop.")
+            else:
+                try:
+                    saved = save_pending_names()
+                except Exception as exc:
+                    status_var.set("Participant names could not be saved.")
+                    messagebox.showerror("Save participants", str(exc))
+                    return
+                status_var.set("Participants saved." if saved else "Participants unchanged.")
+            window.destroy()
+
+        ttk.Button(actions, text="Apply", command=apply_participants).pack(
+            side="right", padx=(0, 6)
+        )
 
     def open_vocabulary():
         if state["running"]:
@@ -1213,6 +1307,10 @@ def build_ui():
 
     def close():
         state["running"] = False
+        try:
+            save_pending_names()
+        except Exception as exc:
+            messagebox.showerror("Uloženie účastníkov", str(exc))
         try:
             save_current_transcript()
         except Exception as exc:
