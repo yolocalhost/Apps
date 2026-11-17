@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import difflib
 import os
 import queue
 import re
+import subprocess
 import threading
 import time
+import unicodedata
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -48,6 +51,14 @@ WORD_PATTERN = re.compile(r"[A-Za-zÀ-ž]+(?:['’-][A-Za-zÀ-ž]+)?")
 OCR_TEXT_PATTERN = re.compile(r"[A-Za-zÀ-ž]{2,}")
 COMPARABLE_WORD_PATTERN = re.compile(r"[A-Za-zÀ-ž0-9]+")
 MIN_OCR_OVERLAP_WORDS = 3
+SPEAKER_BADGE_PATTERN = re.compile(
+    r"[A-ZÀ-Ž][A-Za-zÀ-ž.'-]*(?:\s+[A-ZÀ-Ž][A-Za-zÀ-ž.'-]*){1,4}"
+    r"\s+\d{3,8}(?:\s+[A-Za-zÀ-ž]{2,6})?"
+)
+NAME_BADGE_PATTERN = re.compile(r"\d{1,8}(?:\s+[A-Za-zÀ-ž]{2,6})?")
+KEPT_BADGE_PATTERN = re.compile(r"\d{3,8}(?:\s+[A-Za-zÀ-ž]{2,6})?")
+NAME_MATCH_RATIO = 0.85
+BADGED_NAME_MATCH_RATIO = 0.8
 STOPWORDS = {
     "English": frozenset(
         (
@@ -298,6 +309,77 @@ def normalize_line(line):
     return clean
 
 
+def name_tokens(text):
+    folded = unicodedata.normalize("NFKD", text.casefold())
+    folded = "".join(char for char in folded if not unicodedata.combining(char))
+    return [token for token in re.split(r"[^0-9a-z]+", folded) if token]
+
+
+def is_badge_tokens(tokens):
+    return bool(NAME_BADGE_PATTERN.fullmatch(" ".join(tokens)))
+
+
+def badge_suffix(rest):
+    badge = " ".join(rest)
+    if not KEPT_BADGE_PATTERN.fullmatch(badge):
+        return ""
+    return " ".join(token.upper() if token.isalpha() else token for token in rest)
+
+
+def match_speaker_name(label, names):
+    label_tokens = name_tokens(label)
+    if not label_tokens:
+        return "", []
+
+    label_text = "".join(label_tokens)
+    for name in names:
+        name_parts = name_tokens(name)
+        size = len(name_parts)
+        if not size:
+            continue
+
+        head = label_tokens[:size]
+        rest = label_tokens[size:]
+        if head == name_parts and (not rest or is_badge_tokens(rest)):
+            return name, rest
+
+        if size == 1:
+            continue
+
+        if len(label_tokens) == size:
+            if label_text == "".join(name_parts):
+                return name, []
+            ratio = difflib.SequenceMatcher(
+                None, label_text, "".join(name_parts)
+            ).ratio()
+            if ratio >= NAME_MATCH_RATIO:
+                return name, []
+
+        if (
+            len(head) == size
+            and is_badge_tokens(rest)
+            and len(label_text) >= 8
+            and difflib.SequenceMatcher(
+                None, "".join(head), "".join(name_parts)
+            ).ratio()
+            >= BADGED_NAME_MATCH_RATIO
+        ):
+            return name, rest
+
+    for name in names:
+        name_parts = name_tokens(name)
+        size = len(name_parts)
+        if size < 3:
+            continue
+        if label_tokens == name_parts[: size - 1]:
+            return name, []
+        if label_tokens[: size - 1] == name_parts[: size - 1]:
+            rest = label_tokens[size - 1 :]
+            if is_badge_tokens(rest):
+                return name, rest
+    return "", []
+
+
 def canonical_speaker_label(line, names):
     clean = normalize_line(line)
     if not clean:
@@ -308,7 +390,7 @@ def canonical_speaker_label(line, names):
         clean,
     )
     prefix = timestamp_match.group("prefix") or ""
-    label = timestamp_match.group("label")
+    label = timestamp_match.group("label").strip()
     folded_label = label.casefold()
     for name in names:
         folded_name = name.casefold()
@@ -316,16 +398,18 @@ def canonical_speaker_label(line, names):
             return prefix + name
         if folded_label.startswith(folded_name + " "):
             suffix = label[len(name):].strip()
-            if re.fullmatch(r"\d{3,8}(?:\s+[A-Za-z]{2,6})?", suffix):
-                return f"{prefix}{name} {suffix}"
-            return prefix + name
+            if NAME_BADGE_PATTERN.fullmatch(suffix):
+                kept = badge_suffix(name_tokens(suffix))
+                return f"{prefix}{name} {kept}".rstrip()
 
-    if re.fullmatch(
-        r"[A-Za-zÀ-ž][A-Za-zÀ-ž.'-]*(?:\s+[A-Za-zÀ-ž][A-Za-zÀ-ž.'-]*){1,4}"
-        r"\s+\d{3,8}(?:\s+[A-Za-zÀ-ž]{2,6})?",
-        label,
-    ):
-        return clean
+    matched_name, rest = match_speaker_name(label, names)
+    if matched_name:
+        suffix = badge_suffix(rest)
+        return f"{prefix}{matched_name} {suffix}".rstrip()
+
+    trimmed = label.strip(" \t•*.:>|")
+    if SPEAKER_BADGE_PATTERN.fullmatch(trimmed):
+        return prefix + trimmed
     return ""
 
 
@@ -557,25 +641,87 @@ def upsert_ocr_line(line, source_language, names, speaker_context=None):
     return add_entry(clean, translated, False, speaker)
 
 
+def starts_inline_block(tail):
+    if not tail:
+        return True
+    stripped = tail.lstrip(" \t,;:-")
+    if stripped == tail:
+        return False
+    return stripped[:1].isupper() or stripped[:1].isdigit()
+
+
+def consume_badge_tail(tail):
+    match = re.match(r"\s*\d{1,8}(?:\s+[A-ZÀ-Ž]{2,6}(?![A-Za-zÀ-ž]))?", tail)
+    return match.end() if match else 0
+
+
+def split_embedded_speaker(text, names):
+    """Split text where a participant badge was read inline so it starts a speaker block."""
+    segments = []
+    remaining = text.strip()
+    while remaining:
+        found = None
+        lowered = remaining.casefold()
+        for name in names:
+            if len(name_tokens(name)) < 2:
+                continue
+            needle = name.casefold()
+            position = lowered.find(needle)
+            while position != -1:
+                end = position + len(name)
+                tail = remaining[end:]
+                badge_length = consume_badge_tail(tail)
+                starts_block = position == 0 or bool(
+                    re.search(r"[.!?][\s•*·>|\-]*$", remaining[:position])
+                )
+                ends_word = end >= len(remaining) or not remaining[end].isalnum()
+                if (
+                    starts_block
+                    and ends_word
+                    and starts_inline_block(tail[badge_length:])
+                    and (found is None or position < found[0])
+                ):
+                    found = (position, end, badge_length, name)
+                    break
+                position = lowered.find(needle, position + 1)
+        if found is None:
+            break
+
+        position, end, badge_length, name = found
+        head = remaining[:position].strip()
+        if re.search(r"[.!?][\s•*·>|\-]*$", head):
+            head = re.sub(r"[\s•*·>|\-]+$", "", head)
+        if head:
+            segments.append(head)
+        segments.append(name + remaining[end : end + badge_length].rstrip())
+        remaining = remaining[end + badge_length :].lstrip(" \t,;:-").strip()
+    if remaining:
+        segments.append(remaining)
+    return segments
+
+
 def process_ocr_lines(lines, source_language, names):
     state["revision_entry_id"] = state["active_entry_id"]
     scan_speaker = state["current_speaker"]
     text_lines = []
 
     def flush_text():
-        nonlocal text_lines
+        nonlocal text_lines, scan_speaker
         text = merge_ocr_fragments(text_lines)
         text_lines = []
         if not text:
             return
-        event = upsert_ocr_line(
-            text,
-            source_language,
-            names,
-            speaker_context=scan_speaker,
-        )
-        if event is not None:
-            events.put(event)
+        for segment in split_embedded_speaker(text, names):
+            event = upsert_ocr_line(
+                segment,
+                source_language,
+                names,
+                speaker_context=scan_speaker,
+            )
+            if event is not None:
+                events.put(event)
+            if canonical_speaker_label(segment, names):
+                scan_speaker = state["current_speaker"]
 
     for line in lines:
         clean = normalize_line(line)
@@ -629,6 +775,13 @@ def available_transcripts(root=TRANSCRIPTS_PATH):
 def transcript_label(path, root=TRANSCRIPTS_PATH):
     relative = path.relative_to(root).as_posix()
     return relative.removesuffix("_original.txt")
+
+
+def open_transcripts_folder(root=TRANSCRIPTS_PATH):
+    if not root.is_dir():
+        messagebox.showinfo("Transcripts", "Zložka s transcriptmi zatiaľ neexistuje.")
+        return
+    subprocess.run(["open", str(root)], check=False)
 
 
 def load_transcript_entries(path, names):
@@ -990,6 +1143,9 @@ def build_ui():
     learn_button.pack(side="left")
     ttk.Button(
         toolbar, text="Participants", command=lambda: open_participants()
+    ).pack(side="left", padx=(6, 0))
+    ttk.Button(
+        toolbar, text="Transcripts", command=open_transcripts_folder
     ).pack(side="left", padx=(6, 0))
     ttk.Label(toolbar, textvariable=region_var).pack(side="left", padx=8)
     ttk.Label(toolbar, textvariable=status_var).pack(side="right")

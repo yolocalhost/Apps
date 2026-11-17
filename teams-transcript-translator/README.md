@@ -31,6 +31,7 @@ Set `TEAMS_TRANSLATOR_MODEL_PATH` before starting the app to use a different mod
 5. Click `Participants` to add or edit names, one participant per line. While transcription runs, OCR uses the changes on the next scan and `Stop` saves them to `names.txt`; while stopped, `Apply` saves them immediately.
 6. When OCR is stopped, click `Learn words` to see the most frequent transcript words and their Slovak translations. This is available when the app opens, so you can choose an older saved session before starting a new scan. Common helper words, names, and words already marked as known are omitted.
 7. In `Session words`, choose `Aktuálna session` or an older saved transcript, select the input language, and click `Už viem` after selecting words you already know. The known-word list is stored locally in `known_words.txt` and is reused in future sessions. Completed vocabulary translations are cached in `vocabulary_translations.txt`, so refreshing the list does not translate the same word again.
+8. Click `Transcripts` to open the `transcripts` folder in Finder for quick navigation to saved sessions.
 
 After clicking `Stop`, the current transcript is saved automatically as two UTF-8 text files: one original and one Slovak translation. Each new OCR session is saved to a new file pair under `transcripts/YYYY/MM/DD/` with a time-based filename. If the app is closed while OCR is running, the current transcript is saved then as well.
 
@@ -42,7 +43,7 @@ OCR lines belonging to the same visible speaker block are shown as one paragraph
 
 When a speaker returns after another speaker, the speaker heading is shown again. This keeps a short utterance from absorbing the next speaker's text.
 
-Names from `names.txt` are kept as the canonical speaker labels. OCR characters picked up from a Teams badge or other icon after a known name are discarded; numeric Teams suffixes are kept.
+Names from `names.txt` are kept as the canonical speaker labels. Teams speaker badges are matched tolerantly: bullet or punctuation noise before and after the name, separated or joined words, stray badge characters, `Name Surname` alone, and the numeric Teams suffix are all recognized, so a badge such as `Vlad Radu | BCR` or `Vlad Radu BCR 6076 ED` still resolves to the configured participant. Numeric Teams suffixes are kept in the label. A participant badge that OCR reads in the middle of a paragraph starts a new speaker block instead of becoming part of the previous speaker's text.
 
 Obvious OCR fragments without normal text, such as `-**+` or `***`, are ignored.
 
