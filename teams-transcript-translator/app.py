@@ -23,6 +23,8 @@ except ModuleNotFoundError as exc:
         ) from exc
     raise
 
+import meeting_notes
+
 try:
     import Quartz
     import Vision
@@ -45,6 +47,7 @@ NAMES_PATH = Path(__file__).with_name("names.txt")
 TRANSCRIPTS_PATH = Path(__file__).with_name("transcripts")
 KNOWN_WORDS_PATH = Path(__file__).with_name("known_words.txt")
 VOCABULARY_TRANSLATIONS_PATH = Path(__file__).with_name("vocabulary_translations.txt")
+MEETING_NOTES_ENABLED = os.environ.get("TEAMS_TRANSLATOR_MEETING_NOTES", "1") != "0"
 SCAN_INTERVAL = 1.0
 VOCABULARY_LIMIT = 20
 WORD_PATTERN = re.compile(r"[A-Za-zÀ-ž]+(?:['’-][A-Za-zÀ-ž]+)?")
@@ -855,6 +858,22 @@ def save_transcript(entries, root=TRANSCRIPTS_PATH, saved_at=None):
     return original_path, translation_path
 
 
+def extract_meeting_notes(original_path):
+    def run():
+        events.put(("status", "Transcript uložený. Spracúvam poznámky pre memory..."))
+        try:
+            notes, _, memory_error = meeting_notes.process_transcript(original_path)
+        except Exception as exc:
+            events.put(("status", f"Poznámky zlyhali: {exc}"))
+            return
+        if memory_error:
+            events.put(("status", f"Poznámky uložené lokálne, memory zlyhala: {memory_error}"))
+        else:
+            events.put(("status", f"Poznámky: {meeting_notes.summary_line(notes)}"))
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 def save_current_transcript():
     if state["transcript_saved"]:
         return None
@@ -1086,6 +1105,8 @@ def stop_capture(status_var, start_button, stop_button, learn_button):
         if saved_paths:
             saved_messages.append("Transcript uložený.")
         status_var.set(" ".join(saved_messages) or "Zastavené - nič na uloženie.")
+        if saved_paths and MEETING_NOTES_ENABLED:
+            extract_meeting_notes(saved_paths[0])
     start_button.configure(state="normal")
     stop_button.configure(state="disabled")
     learn_button.configure(state="normal")

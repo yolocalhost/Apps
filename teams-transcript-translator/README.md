@@ -49,4 +49,34 @@ Obvious OCR fragments without normal text, such as `-**+` or `***`, are ignored.
 
 macOS must allow the terminal or Python process to use Screen Recording in System Settings > Privacy & Security.
 
-The application is local-only. It does not send screenshots or transcript text to a remote service.
+The OCR and translation are local-only. Screenshots never leave the machine. Transcript text is sent only to the internal ECP LLM for meeting notes, described below.
+
+## Meeting notes for Codex and Copilot
+
+After `Stop` saves a transcript, `meeting_notes.py` runs in the background. It:
+
+1. Removes repeated OCR fragments from `transcript_*_original.txt`.
+2. Asks the ECP LLM (`https://llm.ecp.erste.ai/v1`, default model `ECP-DeepSeek-V4.1-Flash-1017`, fallback `ECP-GLM-5.3-Flash`) for English notes: decisions, facts, action items, open questions, and contacts.
+3. Assigns each note to a project folder in `~/Downloads/Projects`, for example `bindplane`. Notes that fit no project use the scope `meetings`.
+4. Compares the notes with existing memories in that scope and writes new ones or updates existing ones in the `memory` MCP server (`http://127.0.0.1:8765/mcp`). Each note has scope `repo:<project>` and tags `meeting`, the note type, and the meeting date.
+5. Saves a readable copy next to the transcript as `transcript_*_notes.md`. If the memory server is unreachable, the notes are still saved locally and the error is written into this file.
+
+Projects whose `AGENTS.md` tells the agent to run `memory_search` with `tag="meeting"`, such as `bindplane`, then show the notes in every new Codex or Copilot session.
+
+Store the ECP API key once in the macOS Keychain (the command prompts for the key):
+
+```bash
+security add-generic-password -U -s "ECP LLM API Key" -a ecp -w
+```
+
+`ECP_API_KEY` in the environment overrides the Keychain. The memory token is read from `MEMORY_TOKEN` or the existing Keychain item `aiMemory MCP Token`.
+
+Process older transcripts or retry from the command line:
+
+```bash
+python3 meeting_notes.py --all                       # every transcript without a notes file
+python3 meeting_notes.py --dry-run transcripts/2026/11/18/transcript_110035_original.txt
+python3 meeting_notes.py --force transcripts/2026/11/18/transcript_110035_original.txt
+```
+
+Optional settings: `MEETING_NOTES_MODEL`, `MEETING_NOTES_FALLBACK_MODEL`, `MEETING_NOTES_PROJECTS_PATH`, `MEMORY_URL`. Set `TEAMS_TRANSLATOR_MEETING_NOTES=0` to turn off the automatic run after `Stop`.

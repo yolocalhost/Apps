@@ -1,8 +1,22 @@
 # Repository Guidelines
 
+## Memory
+
+`memory` (MCP server at `http://127.0.0.1:8765/mcp`) is the primary store for durable
+knowledge across sessions. Use scope `repo:teams-transcript-translator` for work in this repository.
+
+- Call `memory_search` before starting a task, using this repository's name and the topic.
+- Call `memory_write` for durable facts, decisions, and preferences the user states, and
+  when you settle a question that will matter again. One atomic fact per memory.
+- Call `memory_update` rather than writing a duplicate when a stored fact changes.
+- Never store secrets, tokens, credentials, customer data, or transient logs.
+- Code, configuration, and the documents named in this file stay authoritative. When a
+  memory entry conflicts with them, trust the repository and correct the memory.
+
 ## Project Structure
 
 - `app.py` contains the complete local Tkinter application, screen capture, Apple Vision OCR, and translation flow.
+- `meeting_notes.py` extracts English project notes from saved `*_original.txt` transcripts with the internal ECP LLM and stores them in the `memory` MCP server (scope `repo:<project>`, tag `meeting`). It runs after `Stop` and as a CLI.
 - `names.txt` contains optional speaker names, one per line. Keep this file free of secrets.
 - `requirements.txt` lists the small set of Python and macOS dependencies.
 - `README.md` documents setup and normal use. `.venv/` is local environment state, not source code.
@@ -36,4 +50,4 @@ After every repository change, run the relevant verification, commit all intende
 
 ## Security and Configuration
 
-Keep the application local-only. Do not add remote upload or telemetry behavior without an explicit requirement. Treat captured transcript text, speaker names, and model paths as potentially sensitive.
+Keep OCR and translation local-only. The only remote services allowed are the internal ECP LLM endpoint and the local `memory` server used by `meeting_notes.py`; do not add other upload or telemetry behavior without an explicit requirement. Read the ECP API key and memory token from the environment or macOS Keychain, never from files in this repository. Treat captured transcript text, speaker names, and model paths as potentially sensitive.
