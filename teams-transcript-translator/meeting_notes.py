@@ -68,7 +68,8 @@ Rules:
 - Never include passwords, tokens, API keys, enrollment secrets, or other credentials.
 - Do not invent facts. If unsure about a detail, leave it out.
 - Assign each note to exactly one project from the project list using its name verbatim, or
-  use "{fallback}" when no project fits.
+  use "{fallback}" when no project fits. Route by what the note is mainly about; general team,
+  staffing, budget, or meeting-logistics notes that are not about a listed project go to "{fallback}".
 - Prefer fewer, high-value notes over many trivial ones. Return an empty list if nothing is worth keeping.
 
 Projects:
@@ -80,13 +81,14 @@ Return only JSON:
 {{"notes": [{{"project": "...", "type": "decision|fact|action-item|open-question|contact",
 "title": "short title, max 80 chars", "content": "1-4 sentences", "tags": ["topic", "..."]}}]}}"""
 
-DEDUP_PROMPT = """You maintain an agent memory store for project "{project}".
-Compare each new meeting note with the existing memories and decide:
-- "new": no existing memory covers it.
-- "update": an existing memory covers the same subject but the new note adds or changes
-  information. Give that memory's id and the merged English content (1-5 sentences) that keeps
-  still-valid old details and applies the new information.
-- "skip": an existing memory already says the same thing.
+DEDUP_PROMPT = """You maintain an agent memory store. Compare each new meeting note with the
+existing memories (from any project scope) and with earlier new notes in this list, and decide:
+- "skip": the core information is already stored or appears in an earlier new note, even if
+  wording, detail level, or project scope differ. When in doubt, choose skip.
+- "update": an existing memory covers the same subject and the new note materially changes or
+  extends it (new decision, status, owner, date, number, identifier). Give that memory's id and
+  merged English content (1-5 sentences) that keeps still-valid old details and applies the change.
+- "new": no existing memory or earlier new note covers the subject.
 
 Existing memories:
 {existing}
@@ -94,7 +96,7 @@ Existing memories:
 New notes:
 {notes}
 
-Return only JSON:
+Return only JSON with one decision per new note:
 {{"decisions": [{{"index": 0, "action": "new|update|skip", "memory_id": "id or null",
 "content": "merged content for update, else null"}}]}}"""
 
@@ -168,8 +170,10 @@ def chat_json(prompt, content, model=None):
                 {"role": "user", "content": content},
             ],
             "temperature": 0.1,
-            "max_tokens": 8000,
+            "max_tokens": 16000,
             "response_format": {"type": "json_object"},
+            # Without this the ECP reasoning models can spend the whole token budget thinking.
+            "chat_template_kwargs": {"enable_thinking": False, "thinking": False},
         }
         try:
             _, body = post_json(
@@ -177,7 +181,10 @@ def chat_json(prompt, content, model=None):
                 payload,
                 {"Authorization": f"Bearer {llm_api_key()}"},
             )
-            reply = json.loads(body)["choices"][0]["message"]["content"] or ""
+            choice = json.loads(body)["choices"][0]
+            reply = choice["message"].get("content") or ""
+            if not reply:
+                raise ValueError(f"empty reply (finish_reason={choice.get('finish_reason')})")
             return parse_json_reply(reply)
         except (RuntimeError, ValueError, KeyError, IndexError) as exc:
             if "API key not found" in str(exc):
@@ -388,25 +395,32 @@ def note_content(note, path):
     return f"{note['content']}\n\nSource: Teams meeting {source} ({path.stem.removesuffix('_original')})."
 
 
-def existing_memories(client, scope):
-    reply = client.call("memory_search", query="", scope=scope, limit=EXISTING_LIMIT)
-    return reply.get("results", [])
+def existing_memories(client, scopes):
+    memories = {}
+    for scope in scopes:
+        reply = client.call("memory_search", query="", scope=scope, limit=EXISTING_LIMIT)
+        for item in reply.get("results", []):
+            memories.setdefault(item["id"], None)
+    return [client.call("memory_get", memory_id=memory_id) for memory_id in memories]
 
 
-def dedup_decisions(project, notes, existing):
-    if not existing:
+def memory_body(memory):
+    return memory["content"].split("\n\nSource:")[0]
+
+
+def dedup_decisions(notes, existing):
+    if not existing and len(notes) < 2:
         return [{"index": index, "action": "new"} for index in range(len(notes))]
     existing_text = "\n".join(
-        f"- id={item['id']} title={item['title']!r}: {item.get('snippet', '')}" for item in existing
-    )
+        f"- id={item['id']} scope={item['scope']} title={item['title']!r}: {memory_body(item)}"
+        for item in existing
+    ) or "(none)"
     notes_text = "\n".join(
         f"{index}. [{note['type']}] {note['title']}: {note['content']}"
         for index, note in enumerate(notes)
     )
-    reply = chat_json(
-        DEDUP_PROMPT.format(project=project, existing=existing_text, notes=notes_text), "Decide."
-    )
-    known_ids = {item["id"] for item in existing}
+    reply = chat_json(DEDUP_PROMPT.format(existing=existing_text, notes=notes_text), "Decide.")
+    meeting_ids = {item["id"] for item in existing if "meeting" in item["tags"]}
     decisions = {}
     for decision in reply.get("decisions", []):
         try:
@@ -414,8 +428,9 @@ def dedup_decisions(project, notes, existing):
         except (TypeError, ValueError):
             continue
         action = decision.get("action")
+        # Only meeting memories are rewritten; memories written by agents or by hand stay untouched.
         if action == "update" and (
-            decision.get("memory_id") not in known_ids or not decision.get("content")
+            decision.get("memory_id") not in meeting_ids or not decision.get("content")
         ):
             action = "new"
         if 0 <= index < len(notes) and action in ("new", "update", "skip"):
@@ -425,37 +440,40 @@ def dedup_decisions(project, notes, existing):
 
 def store_notes(notes, path, projects, client):
     date, _ = meeting_info(path)
-    by_scope = {}
     for note in notes:
-        by_scope.setdefault(project_scope(note["project"], projects), []).append(note)
+        note["scope"] = project_scope(note["project"], projects)
+    scopes = dict.fromkeys([*(note["scope"] for note in notes), FALLBACK_SCOPE])
+    existing = existing_memories(client, scopes)
+    by_id = {item["id"]: item for item in existing}
 
-    for scope, scoped_notes in by_scope.items():
-        existing = existing_memories(client, scope)
-        for decision in dedup_decisions(scope, scoped_notes, existing):
-            note = scoped_notes[decision["index"]]
-            note["scope"] = scope
-            if decision["action"] == "skip":
-                note["memory"] = "skipped (already in memory)"
-                continue
-            if decision["action"] == "update":
-                merged = redact_secrets(str(decision["content"]).strip())
-                result = client.call(
-                    "memory_update",
-                    memory_id=decision["memory_id"],
-                    content=note_content({**note, "content": merged}, path),
-                    tags=memory_tags(note, date),
-                )
-                note["memory"] = f"updated {result['id']}"
-                continue
+    for decision in dedup_decisions(notes, existing):
+        note = notes[decision["index"]]
+        if decision["action"] == "skip":
+            note["memory"] = "skipped (already in memory)"
+            continue
+        if decision["action"] == "update":
+            current = by_id[decision["memory_id"]]
+            merged = redact_secrets(str(decision["content"]).strip())
+            tags = ",".join(dict.fromkeys([*current["tags"], *memory_tags(note, date).split(",")]))
             result = client.call(
-                "memory_write",
-                content=note_content(note, path),
-                title=note["title"],
-                kind=MEMORY_KINDS[note["type"]],
-                scope=scope,
-                tags=memory_tags(note, date),
+                "memory_update",
+                memory_id=current["id"],
+                content=note_content({**note, "content": merged}, path),
+                tags=tags,
+                expected_revision=current["revision"],
             )
-            note["memory"] = f"{result['action']} {result['id']}"
+            note["scope"] = current["scope"]
+            note["memory"] = f"updated {result['id']}"
+            continue
+        result = client.call(
+            "memory_write",
+            content=note_content(note, path),
+            title=note["title"],
+            kind=MEMORY_KINDS[note["type"]],
+            scope=note["scope"],
+            tags=memory_tags(note, date),
+        )
+        note["memory"] = f"{result['action']} {result['id']}"
 
 
 def notes_path(path):
@@ -471,7 +489,7 @@ def write_local_notes(notes, path, projects, memory_error=None):
         lines.append("No durable notes found.")
     grouped = {}
     for note in notes:
-        grouped.setdefault(project_scope(note["project"], projects), []).append(note)
+        grouped.setdefault(note.get("scope") or project_scope(note["project"], projects), []).append(note)
     for scope, scoped_notes in grouped.items():
         lines += [f"## {scope}", ""]
         for note in scoped_notes:
