@@ -58,8 +58,10 @@ After `Stop` saves a transcript, `meeting_notes.py` runs in the background. It:
 1. Removes repeated OCR fragments from `transcript_*_original.txt`.
 2. Asks the ECP LLM (`https://llm.ecp.erste.ai/v1`, default model `ECP-DeepSeek-V4.1-Flash-1017`, fallback `ECP-GLM-5.3-Flash`) for English notes: decisions, facts, action items, open questions, and contacts.
 3. Assigns each note to a project folder in `~/Downloads/Projects`, for example `bindplane`. Notes that fit no project use the scope `meetings`.
-4. Compares the notes with existing memories in all affected scopes and writes new ones, updates earlier meeting notes, or skips duplicates in the `memory` MCP server (`http://127.0.0.1:8765/mcp`). Memories written by agents or by hand are never rewritten. Each note has scope `repo:<project>` and tags `meeting`, the note type, and the meeting date.
+4. Compares the notes with existing memories in all affected scopes and writes new ones, updates earlier meeting notes, or skips duplicates in the `memory` MCP server (`http://127.0.0.1:8765/mcp`). Memories written by agents or by hand are never rewritten. Each note has scope `repo:<project>`, a title starting with the meeting date (`YYYY-MM-DD: ...`), and tags `meeting`, the note type, and the meeting date.
 5. Saves a readable copy next to the transcript as `transcript_*_notes.md`. If the memory server is unreachable, the notes are still saved locally and the error is written into this file.
+
+Newer meetings win. Transcripts are always processed from the oldest meeting to the newest, including with `--all`. A note may update only a memory from the same or an earlier meeting. When a newer memory covers the same subject, notes from older transcripts are skipped, even if they are processed later.
 
 Projects whose `AGENTS.md` tells the agent to run `memory_search` with `tag="meeting"`, such as `bindplane`, then show the notes in every new Codex or Copilot session.
 

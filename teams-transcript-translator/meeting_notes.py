@@ -34,6 +34,8 @@ MEMORY_KINDS = {
     "action-item": "note",
     "open-question": "note",
 }
+SOURCE_PATTERN = re.compile(r"Source: Teams meeting (\d{4}-\d{2}-\d{2})(?: (\d{2}:\d{2}))?")
+DATE_TAG_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
 TRANSCRIPT_NAME_PATTERN = re.compile(r"transcript_(\d{2})(\d{2})(\d{2})(?:_\d+)?_original\.txt$")
 BADGE_PATTERN = re.compile(r"\s*\b\d{3,8}\s+(?:ED-EXT|ED|EXT|BCR)\w*\s*\|?\s*")
 SENTENCE_SPLIT_PATTERN = re.compile(r"(?<=[.?!])\s+|\s+\|\s+")
@@ -81,13 +83,18 @@ Return only JSON:
 {{"notes": [{{"project": "...", "type": "decision|fact|action-item|open-question|contact",
 "title": "short title, max 80 chars", "content": "1-4 sentences", "tags": ["topic", "..."]}}]}}"""
 
-DEDUP_PROMPT = """You maintain an agent memory store. Compare each new meeting note with the
-existing memories (from any project scope) and with earlier new notes in this list, and decide:
+DEDUP_PROMPT = """You maintain an agent memory store. The new notes come from a meeting held on
+{meeting}. Each existing memory shows the date of the meeting it comes from (or "unknown").
+Compare each new note with the existing memories (from any project scope) and with earlier new
+notes in this list, and decide:
 - "skip": the core information is already stored or appears in an earlier new note, even if
-  wording, detail level, or project scope differ. When in doubt, choose skip.
-- "update": an existing memory covers the same subject and the new note materially changes or
-  extends it (new decision, status, owner, date, number, identifier). Give that memory's id and
-  merged English content (1-5 sentences) that keeps still-valid old details and applies the change.
+  wording, detail level, or project scope differ. Also skip when a memory from a LATER meeting
+  covers the same subject, even if it contradicts the new note: the later meeting is more current.
+  When in doubt, choose skip.
+- "update": an existing memory from the same or an EARLIER meeting covers the same subject and the
+  new note materially changes or extends it (new decision, status, owner, date, number,
+  identifier). Give that memory's id and merged English content (1-5 sentences) that keeps
+  still-valid old details and applies the change; the new note wins where they conflict.
 - "new": no existing memory or earlier new note covers the subject.
 
 Existing memories:
@@ -336,7 +343,7 @@ def normalize_note(note, projects):
     if not isinstance(note, dict):
         return None
     content = redact_secrets(str(note.get("content", "")).strip())
-    title = redact_secrets(str(note.get("title", "")).strip())[:200]
+    title = redact_secrets(str(note.get("title", "")).strip())[:180]
     if not content or not title:
         return None
     note_type = str(note.get("type", "fact")).strip().lower()
@@ -382,6 +389,24 @@ def meeting_info(path):
     return date, time
 
 
+def meeting_key(path):
+    return " ".join(part for part in meeting_info(path) if part)
+
+
+def memory_meeting_key(memory):
+    """Date and time of the newest meeting a memory comes from, or "" when unknown."""
+    keys = [
+        f"{date} {time}".strip()
+        for date, time in SOURCE_PATTERN.findall(memory.get("content", ""))
+    ]
+    keys += [tag for tag in memory.get("tags", []) if DATE_TAG_PATTERN.fullmatch(tag)]
+    return max(keys, default="")
+
+
+def dated_title(title, date):
+    return f"{date}: {title}" if date else title
+
+
 def memory_tags(note, date):
     tags = ["meeting", note["type"], *note["tags"]]
     if date:
@@ -408,19 +433,24 @@ def memory_body(memory):
     return memory["content"].split("\n\nSource:")[0]
 
 
-def dedup_decisions(notes, existing):
+def dedup_decisions(notes, existing, meeting):
     if not existing and len(notes) < 2:
         return [{"index": index, "action": "new"} for index in range(len(notes))]
     existing_text = "\n".join(
-        f"- id={item['id']} scope={item['scope']} title={item['title']!r}: {memory_body(item)}"
+        f"- id={item['id']} meeting={memory_meeting_key(item) or 'unknown'} "
+        f"scope={item['scope']} title={item['title']!r}: {memory_body(item)}"
         for item in existing
     ) or "(none)"
     notes_text = "\n".join(
         f"{index}. [{note['type']}] {note['title']}: {note['content']}"
         for index, note in enumerate(notes)
     )
-    reply = chat_json(DEDUP_PROMPT.format(existing=existing_text, notes=notes_text), "Decide.")
+    reply = chat_json(
+        DEDUP_PROMPT.format(meeting=meeting or "unknown", existing=existing_text, notes=notes_text),
+        "Decide.",
+    )
     meeting_ids = {item["id"] for item in existing if "meeting" in item["tags"]}
+    newer_ids = {item["id"] for item in existing if memory_meeting_key(item) > meeting}
     decisions = {}
     for decision in reply.get("decisions", []):
         try:
@@ -428,6 +458,9 @@ def dedup_decisions(notes, existing):
         except (TypeError, ValueError):
             continue
         action = decision.get("action")
+        # An older meeting must never overwrite information from a newer one.
+        if action == "update" and decision.get("memory_id") in newer_ids:
+            action = "skip"
         # Only meeting memories are rewritten; memories written by agents or by hand stay untouched.
         if action == "update" and (
             decision.get("memory_id") not in meeting_ids or not decision.get("content")
@@ -446,7 +479,7 @@ def store_notes(notes, path, projects, client):
     existing = existing_memories(client, scopes)
     by_id = {item["id"]: item for item in existing}
 
-    for decision in dedup_decisions(notes, existing):
+    for decision in dedup_decisions(notes, existing, meeting_key(path)):
         note = notes[decision["index"]]
         if decision["action"] == "skip":
             note["memory"] = "skipped (already in memory)"
@@ -458,6 +491,7 @@ def store_notes(notes, path, projects, client):
             result = client.call(
                 "memory_update",
                 memory_id=current["id"],
+                title=dated_title(note["title"], date),
                 content=note_content({**note, "content": merged}, path),
                 tags=tags,
                 expected_revision=current["revision"],
@@ -468,7 +502,7 @@ def store_notes(notes, path, projects, client):
         result = client.call(
             "memory_write",
             content=note_content(note, path),
-            title=note["title"],
+            title=dated_title(note["title"], date),
             kind=MEMORY_KINDS[note["type"]],
             scope=note["scope"],
             tags=memory_tags(note, date),
@@ -554,8 +588,13 @@ def main(argv=None):
     if not files:
         parser.error("no transcripts to process")
 
+    # Oldest meeting first, so newer meetings always update older notes and never the reverse.
+    files = sorted(
+        dict.fromkeys(path.resolve() for path in files),
+        key=lambda path: (meeting_key(path), path.name),
+    )
     failed = False
-    for path in dict.fromkeys(files):
+    for path in files:
         if not path.name.endswith("_original.txt"):
             print(f"skip {path} (not an *_original.txt transcript)")
             continue
