@@ -28,7 +28,7 @@ Set `TEAMS_TRANSLATOR_MODEL_PATH` before starting the app to use a different mod
 2. Click `Select area` and drag over the transcript on the primary display.
 3. Click `Start`.
 4. The left panel shows OCR input and the right panel shows the Slovak translation.
-5. Click `Participants` to add or edit names, one participant per line. While transcription runs, OCR uses the changes on the next scan and `Stop` saves them to `names.txt`; while stopped, `Apply` saves them immediately.
+5. Click `Participants` to add or edit names, one participant per line, or click `Scan attendees` to import them from the meeting's attendee list (see below). While transcription runs, OCR uses the changes on the next scan and `Stop` saves them to `names.txt`; while stopped, `Apply` saves them immediately.
 6. When OCR is stopped, click `Learn words` to see the most frequent transcript words and their Slovak translations. This is available when the app opens, so you can choose an older saved session before starting a new scan. Common helper words, names, and words already marked as known are omitted.
 7. In `Session words`, choose `Aktuálna session` or an older saved transcript, select the input language, and click `Už viem` after selecting words you already know. The known-word list is stored locally in `known_words.txt` and is reused in future sessions. Completed vocabulary translations are cached in `vocabulary_translations.txt`, so refreshing the list does not translate the same word again.
 8. Click `Transcripts` to open the `transcripts` folder in Finder for quick navigation to saved sessions.
@@ -45,6 +45,16 @@ After clicking `Stop`, the current transcript is saved automatically as two UTF-
 - Lines deleted in the panel disappear from the files. Text scanned while you were editing is appended after your corrections.
 - Applying edits after `Stop` rewrites the same `_original.txt` and `_translation.txt` pair instead of creating a new one. Pressing `Stop` while editing applies the pending text first.
 - Meeting notes are generated from the corrected original when `Stop` saves a new file. Notes are not regenerated for edits applied after `Stop`; rerun `python3 meeting_notes.py --force <transcript>_original.txt` when you want them refreshed.
+
+### Importing meeting attendees
+
+The `Participants` window can read attendees from the screen, so you do not have to type them:
+
+1. Open the meeting in Outlook or the Teams calendar and click `Tracking` to show the attendee list. Keep the `Participants` window beside it, not over it.
+2. Click `Scan attendees`. The first time, drag over the attendee list; `Attendee area` selects a different area later.
+3. Scroll the list and click `Scan attendees` again until the end of the list. Only new names are added.
+
+Names are added as displayed, including suffixes such as `6076 ED` or `BCR`, and are saved to `names.txt` immediately (after `Stop` while transcription runs). Only text directly above a `Required`, `Optional`, or `Sent on` line counts as an attendee, which skips the meeting description, headings, avatar initials, and e-mail addresses. Names already covered by an existing entry, for example `Plaskur Daniel 6076 ED` when `Plaskur Daniel` exists, are not duplicated. A row cut off at the bottom of the area is picked up after scrolling. OCR can drop diacritics such as `Ćorović` → `Corović`; fix those in the editor and click `Apply`.
 
 The `English` and `German` input selector can be changed while OCR is running. The next screen scan uses the selected language.
 

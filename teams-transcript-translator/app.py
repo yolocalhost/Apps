@@ -63,6 +63,15 @@ NAME_BADGE_PATTERN = re.compile(r"\d{1,8}(?:\s+[A-Za-zÀ-ž]{2,6})?")
 KEPT_BADGE_PATTERN = re.compile(r"\d{3,8}(?:\s+[A-Za-zÀ-ž]{2,6})?")
 NAME_MATCH_RATIO = 0.85
 BADGED_NAME_MATCH_RATIO = 0.8
+ATTENDEE_STATUS_WORDS = frozenset(
+    (
+        "accept accepted attendee attendees declined organiser organizer optional "
+        "required respond responded response sent tentative tracking"
+    ).split()
+)
+ATTENDEE_SKIP_PATTERN = re.compile(r"[@:/\"“”]")
+AVATAR_INITIALS_PATTERN = re.compile(r"^[A-ZÀ-Ž]{1,3}\s+(?=\S+\s+\S)")
+ATTENDEE_STATUS_MATCH_RATIO = 0.75
 STOPWORDS = {
     "English": frozenset(
         (
@@ -107,6 +116,7 @@ state = {
     "names": [],
     "saved_names": [],
     "names_dirty": False,
+    "attendee_region": None,
 }
 
 
@@ -281,7 +291,8 @@ def capture_image(region):
     return image
 
 
-def recognize_text(image, source_language):
+def recognize_text_boxes(image, source_language, language_correction=True):
+    """Return (text, left, top, width, height) in pixels, ordered top to bottom."""
     if Vision is None:
         raise RuntimeError(
             "Chýba Apple Vision. Spusti: python3 -m pip install -r requirements.txt"
@@ -290,21 +301,38 @@ def recognize_text(image, source_language):
     request = Vision.VNRecognizeTextRequest.alloc().init()
     request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
     request.setRecognitionLanguages_(["en-US" if source_language == "English" else "de-DE"])
-    request.setUsesLanguageCorrection_(True)
+    request.setUsesLanguageCorrection_(language_correction)
 
     handler = Vision.VNImageRequestHandler.alloc().initWithCGImage_options_(image, {})
     handler.performRequests_error_([request], None)
     observations = list(request.results() or [])
     observations.sort(key=lambda item: (-item.boundingBox().origin.y, item.boundingBox().origin.x))
 
-    lines = []
+    image_width = Quartz.CGImageGetWidth(image) if Quartz is not None else 1
+    image_height = Quartz.CGImageGetHeight(image) if Quartz is not None else 1
+    boxes = []
     for observation in observations:
         candidates = observation.topCandidates_(1)
-        if candidates:
-            value = str(candidates[0].string()).strip()
-            if value:
-                lines.append(value)
-    return lines
+        if not candidates:
+            continue
+        value = str(candidates[0].string()).strip()
+        if not value:
+            continue
+        box = observation.boundingBox()
+        boxes.append(
+            (
+                value,
+                box.origin.x * image_width,
+                (1 - box.origin.y - box.size.height) * image_height,
+                box.size.width * image_width,
+                box.size.height * image_height,
+            )
+        )
+    return boxes
+
+
+def recognize_text(image, source_language):
+    return [box[0] for box in recognize_text_boxes(image, source_language)]
 
 
 def normalize_line(line):
@@ -416,6 +444,59 @@ def canonical_speaker_label(line, names):
     if SPEAKER_BADGE_PATTERN.fullmatch(trimmed):
         return prefix + trimmed
     return ""
+
+
+def is_attendee_status(text):
+    folded = " ".join(name_tokens(text))
+    if folded.startswith("sent on"):
+        return True
+    return any(
+        difflib.SequenceMatcher(None, folded, word).ratio() >= ATTENDEE_STATUS_MATCH_RATIO
+        for word in ("required", "optional")
+    )
+
+
+def has_status_below(box, status_boxes):
+    _, left, top, _, height = box
+    bottom = top + height
+    return any(
+        abs(status_left - left) <= 2 * height
+        and -0.5 * height <= status_top - bottom <= 1.5 * height
+        for _, status_left, status_top, _, _ in status_boxes
+    )
+
+
+def parse_attendee_boxes(boxes, names):
+    """Return new participant names from an OCR scan of an Outlook/Teams attendee list.
+
+    Attendee rows show "Required"/"Optional" (the organizer "Sent on ...") directly below the
+    name, so when such lines exist only text sitting right above one of them is accepted.
+    """
+    status_boxes = [box for box in boxes if is_attendee_status(box[0])]
+    known = list(names)
+    known_keys = {name.casefold() for name in known}
+    found = []
+    for box in boxes:
+        if status_boxes and not has_status_below(box, status_boxes):
+            continue
+        name = re.sub(r"\s+", " ", box[0]).strip(" \t•·|>›∨").replace("İ", "I")
+        # Avatar initials (for example "PE") can be read on the same line as the name.
+        name = AVATAR_INITIALS_PATTERN.sub("", name)
+        tokens = name_tokens(name)
+        words = [token for token in tokens if token.isalpha() and len(token) > 1]
+        if (
+            len(words) < 2
+            or len(name) > 60
+            or ATTENDEE_SKIP_PATTERN.search(name)
+            or ATTENDEE_STATUS_WORDS.intersection(tokens)
+            or name.casefold() in known_keys
+            or match_speaker_name(name, known)[0]
+        ):
+            continue
+        found.append(name)
+        known.append(name)
+        known_keys.add(name.casefold())
+    return found
 
 
 def comparable_line(line):
@@ -1378,41 +1459,92 @@ def build_ui():
         window = tk.Toplevel(root)
         participants["window"] = window
         window.title("Edit participants")
-        window.geometry("460x400")
-        window.minsize(360, 280)
+        window.geometry("540x460")
+        window.minsize(420, 320)
         window.transient(root)
 
         ttk.Label(
             window,
-            text="Enter one participant per line. Changes during transcription are saved after Stop.",
-            wraplength=420,
+            text=(
+                "Enter one participant per line. Changes during transcription are saved after Stop. "
+                "Scan attendees reads the meeting's attendee list from the screen; scroll the list "
+                "and scan again to add the rest."
+            ),
+            wraplength=500,
         ).pack(fill="x", padx=12, pady=(12, 6))
         editor = scrolledtext.ScrolledText(window, wrap="word", height=14)
         editor.pack(fill="both", expand=True, padx=12, pady=6)
         editor.insert("1.0", "\n".join(state["names"]))
+        scan_var = tk.StringVar()
+        ttk.Label(window, textvariable=scan_var, wraplength=500).pack(fill="x", padx=12)
 
         actions = ttk.Frame(window)
         actions.pack(fill="x", padx=12, pady=(6, 12))
         ttk.Button(actions, text="Cancel", command=window.destroy).pack(side="right")
 
-        def apply_participants():
+        def store_participants():
             names = normalize_names(editor.get("1.0", "end").splitlines())
             state["names"] = names
             state["names_dirty"] = names != state["saved_names"]
             if state["running"]:
-                status_var.set("Participants updated; saved after Stop.")
-            else:
-                try:
-                    saved = save_pending_names()
-                except Exception as exc:
-                    status_var.set("Participant names could not be saved.")
-                    messagebox.showerror("Save participants", str(exc))
-                    return
-                status_var.set("Participants saved." if saved else "Participants unchanged.")
+                return "Participants updated; saved after Stop."
+            return "Participants saved." if save_pending_names() else "Participants unchanged."
+
+        def apply_participants():
+            try:
+                status_var.set(store_participants())
+            except Exception as exc:
+                status_var.set("Participant names could not be saved.")
+                messagebox.showerror("Save participants", str(exc))
+                return
             window.destroy()
+
+        def scan_attendees():
+            if not window.winfo_exists():
+                return
+            if state["attendee_region"] is None:
+                select_attendee_area()
+                return
+            scan_var.set("Scanning attendees...")
+            window.update_idletasks()
+            try:
+                boxes = recognize_text_boxes(
+                    capture_image(state["attendee_region"]),
+                    "English",
+                    language_correction=False,
+                )
+                current = normalize_names(editor.get("1.0", "end").splitlines())
+                found = parse_attendee_boxes(boxes, current)
+                if found:
+                    text = editor.get("1.0", "end-1c").rstrip("\n")
+                    editor.delete("1.0", "end")
+                    editor.insert("1.0", "\n".join(filter(None, [text, *found])))
+                    editor.see("end")
+                    status_var.set(store_participants())
+            except Exception as exc:
+                scan_var.set("Attendee scan failed.")
+                messagebox.showerror("Scan attendees", str(exc), parent=window)
+                return
+            if found:
+                scan_var.set(f"Added {len(found)}: " + ", ".join(found))
+            else:
+                scan_var.set("No new attendees found. Scroll the list and scan again.")
+
+        def set_attendee_area(region):
+            state["attendee_region"] = region
+            # Let the selection overlay disappear before the screen is captured.
+            window.after(300, scan_attendees)
+
+        def select_attendee_area():
+            scan_var.set("Drag over the attendee list (Esc cancels).")
+            select_region(root, set_attendee_area)
 
         ttk.Button(actions, text="Apply", command=apply_participants).pack(
             side="right", padx=(0, 6)
+        )
+        ttk.Button(actions, text="Scan attendees", command=scan_attendees).pack(side="left")
+        ttk.Button(actions, text="Attendee area", command=select_attendee_area).pack(
+            side="left", padx=(6, 0)
         )
 
     def open_vocabulary():
