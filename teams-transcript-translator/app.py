@@ -9,6 +9,7 @@ import threading
 import time
 import unicodedata
 from collections import Counter
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 
@@ -102,6 +103,7 @@ state = {
     "tokenizer": None,
     "source_language": "English",
     "transcript_saved": False,
+    "saved_paths": None,
     "names": [],
     "saved_names": [],
     "names_dirty": False,
@@ -811,6 +813,106 @@ def load_transcript_entries(path, names):
     return entries
 
 
+def parse_displayed_entries(text, names, headings=()):
+    """Rebuild entries from the OCR panel.
+
+    Body lines are rendered indented by two spaces, so speaker-like text inside a sentence cannot
+    turn into a heading. `headings` keeps previously used context labels recognized as headings
+    even when they no longer resolve to a participant name.
+    """
+    known_headings = {comparable_line(heading) for heading in headings if heading}
+    entries = []
+    context = ""
+    for raw_line in text.splitlines():
+        clean = normalize_line(raw_line)
+        if not clean:
+            continue
+
+        if not raw_line.startswith("  "):
+            speaker_label = canonical_speaker_label(clean, names)
+            if not speaker_label and comparable_line(clean) in known_headings:
+                speaker_label = clean
+            if speaker_label:
+                context = speaker_label
+                entries.append(
+                    {
+                        "source": speaker_label,
+                        "translation": speaker_label,
+                        "speaker": True,
+                        "context": speaker_label,
+                    }
+                )
+                continue
+
+        entries.append(
+            {"source": clean, "translation": "", "speaker": False, "context": context}
+        )
+    return entries
+
+
+def entry_key(entry):
+    prefix = "S:" if entry["speaker"] else "B:"
+    return prefix + comparable_line(entry["source"])
+
+
+def align_edited_entries(existing, parsed):
+    """Pair edited lines with the live entries so ids and unchanged translations survive."""
+    entries = []
+    changed_ids = set()
+    old_entries = list(existing)
+    state["next_entry_id"] = max(
+        state["next_entry_id"],
+        max((entry["id"] for entry in old_entries), default=-1) + 1,
+    )
+    matcher = difflib.SequenceMatcher(
+        None,
+        [entry_key(entry) for entry in old_entries],
+        [entry_key(entry) for entry in parsed],
+        autojunk=False,
+    )
+
+    def build(new, old=None):
+        entry = dict(new)
+        if old is None:
+            entry["id"] = state["next_entry_id"]
+            state["next_entry_id"] += 1
+            if not entry["speaker"]:
+                changed_ids.add(entry["id"])
+            entries.append(entry)
+            return
+
+        entry["id"] = old["id"]
+        if entry["speaker"]:
+            entry["translation"] = entry["source"]
+        elif comparable_line(entry["source"]) == comparable_line(old["source"]):
+            entry["translation"] = old.get("translation", "")
+        else:
+            entry["translation"] = ""
+            changed_ids.add(entry["id"])
+        entries.append(entry)
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for old, new in zip(old_entries[i1:i2], parsed[j1:j2]):
+                build(new, old)
+        elif tag == "replace":
+            for offset, new in enumerate(parsed[j1:j2]):
+                old = old_entries[i1 + offset] if i1 + offset < i2 else None
+                build(new, old)
+        elif tag == "insert":
+            for new in parsed[j1:j2]:
+                build(new)
+    return entries, changed_ids
+
+
+def apply_edited_entries(text, names, existing=None):
+    base = state["entries"] if existing is None else existing
+    headings = {
+        entry.get("context", "") for entry in base if entry.get("context")
+    }
+    return align_edited_entries(base, parse_displayed_entries(text, names, headings))
+
+
 def transcript_text(entries, field):
     lines = []
     displayed_speaker = ""
@@ -833,10 +935,30 @@ def transcript_text(entries, field):
     return "\n".join(lines).strip() + "\n" if lines else ""
 
 
+def write_text_atomic(path, text):
+    temp_path = path.with_name(f".{path.name}.tmp")
+    try:
+        temp_path.write_text(text, encoding="utf-8")
+        os.replace(temp_path, path)
+    finally:
+        with suppress(OSError):
+            temp_path.unlink()
+
+
+def write_transcript_files(entries, original_path, translation_path):
+    write_text_atomic(original_path, transcript_text(entries, "source"))
+    write_text_atomic(translation_path, transcript_text(entries, "translation"))
+    return original_path, translation_path
+
+
+def transcript_has_text(entries):
+    return bool(
+        transcript_text(entries, "source") or transcript_text(entries, "translation")
+    )
+
+
 def save_transcript(entries, root=TRANSCRIPTS_PATH, saved_at=None):
-    original = transcript_text(entries, "source")
-    translation = transcript_text(entries, "translation")
-    if not original and not translation:
+    if not transcript_has_text(entries):
         return None
 
     saved_at = saved_at or datetime.now()
@@ -853,9 +975,7 @@ def save_transcript(entries, root=TRANSCRIPTS_PATH, saved_at=None):
         translation_path = day_path / f"{stem_with_suffix}_translation.txt"
         suffix += 1
 
-    original_path.write_text(original, encoding="utf-8")
-    translation_path.write_text(translation, encoding="utf-8")
-    return original_path, translation_path
+    return write_transcript_files(entries, original_path, translation_path)
 
 
 def extract_meeting_notes(original_path):
@@ -881,7 +1001,47 @@ def save_current_transcript():
     saved_paths = save_transcript(state["entries"])
     if saved_paths is not None:
         state["transcript_saved"] = True
+        state["saved_paths"] = saved_paths
     return saved_paths
+
+
+def resave_transcript():
+    saved_paths = state.get("saved_paths")
+    if not saved_paths:
+        return None
+    return write_transcript_files(state["entries"], *saved_paths)
+
+
+def retranslate_entries(entry_ids):
+    def run():
+        for entry_id in entry_ids:
+            entry = next(
+                (item for item in state["entries"] if item["id"] == entry_id), None
+            )
+            if entry is None or entry["speaker"] or entry["translation"]:
+                continue
+            source = entry["source"]
+            try:
+                translation = translate_line(
+                    source, state["source_language"], tuple(state["names"])
+                )
+            except Exception as exc:
+                events.put(("status", f"Preklad úprav zlyhal: {exc}"))
+                return
+            if entry["source"] != source:
+                continue
+            entry["translation"] = translation
+            events.put(
+                ("upsert", entry["id"], source, translation, False, entry["context"])
+            )
+        try:
+            resave_transcript()
+        except Exception as exc:
+            events.put(("status", f"Uloženie úprav zlyhalo: {exc}"))
+            return
+        events.put(("status", "Úpravy preložené a uložené."))
+
+    threading.Thread(target=run, daemon=True).start()
 
 
 def protect_names(text, names):
@@ -1060,17 +1220,22 @@ def capture_loop():
             time.sleep(remaining)
 
 
-def start_capture(source_var, status_var, start_button, stop_button, learn_button):
+def start_capture(
+    source_var, status_var, start_button, stop_button, learn_button, commit_edits=None
+):
     if state["region"] is None:
         messagebox.showwarning("Oblasť nie je vybraná", "Najprv vyber oblasť transcriptu.")
         return
     if state["running"]:
         return
+    if commit_edits is not None:
+        commit_edits()
 
     state["running"] = True
     state["source_language"] = source_var.get()
     state["entries"].clear()
     state["transcript_saved"] = False
+    state["saved_paths"] = None
     state["next_entry_id"] = 0
     state["active_entry_id"] = None
     state["current_speaker"] = ""
@@ -1083,8 +1248,9 @@ def start_capture(source_var, status_var, start_button, stop_button, learn_butto
     threading.Thread(target=capture_loop, daemon=True).start()
 
 
-def stop_capture(status_var, start_button, stop_button, learn_button):
+def stop_capture(status_var, start_button, stop_button, learn_button, commit_edits=None):
     state["running"] = False
+    changed_ids = commit_edits() if commit_edits is not None else set()
     errors = []
     names_saved = False
     try:
@@ -1095,6 +1261,13 @@ def stop_capture(status_var, start_button, stop_button, learn_button):
         saved_paths = save_current_transcript()
     except Exception as exc:
         errors.append(f"Transcript: {exc}")
+    resaved = False
+    if not errors and saved_paths is None and state["saved_paths"]:
+        # A previous Stop already wrote this session's files, so keep them in sync with edits.
+        try:
+            resaved = resave_transcript() is not None
+        except Exception as exc:
+            errors.append(f"Transcript: {exc}")
     if errors:
         status_var.set("Zastavené - uloženie zlyhalo")
         messagebox.showerror("Uloženie zlyhalo", "\n".join(errors))
@@ -1104,7 +1277,11 @@ def stop_capture(status_var, start_button, stop_button, learn_button):
             saved_messages.append("Participants saved.")
         if saved_paths:
             saved_messages.append("Transcript uložený.")
+        elif resaved:
+            saved_messages.append("Transcript aktualizovaný s úpravami.")
         status_var.set(" ".join(saved_messages) or "Zastavené - nič na uloženie.")
+        if changed_ids:
+            retranslate_entries(changed_ids)
         if saved_paths and MEETING_NOTES_ENABLED:
             extract_meeting_notes(saved_paths[0])
     start_button.configure(state="normal")
@@ -1151,17 +1328,19 @@ def build_ui():
 
     ttk.Button(toolbar, text="Select area", command=choose_region).pack(side="left")
     start_button = ttk.Button(toolbar, text="Start", command=lambda: start_capture(
-        source_var, status_var, start_button, stop_button, learn_button
+        source_var, status_var, start_button, stop_button, learn_button, commit_edits
     ))
     start_button.pack(side="left", padx=(6, 0))
     stop_button = ttk.Button(toolbar, text="Stop", state="disabled", command=lambda: stop_capture(
-        status_var, start_button, stop_button, learn_button
+        status_var, start_button, stop_button, learn_button, commit_edits
     ))
     stop_button.pack(side="left", padx=6)
     learn_button = ttk.Button(
         toolbar, text="Learn words", command=lambda: open_vocabulary()
     )
     learn_button.pack(side="left")
+    edit_button = ttk.Button(toolbar, text="Edit text", command=lambda: toggle_editing())
+    edit_button.pack(side="left", padx=(6, 0))
     ttk.Button(
         toolbar, text="Participants", command=lambda: open_participants()
     ).pack(side="left", padx=(6, 0))
@@ -1186,8 +1365,7 @@ def build_ui():
     input_box.tag_configure("speaker", font=("Menlo", 13, "bold"))
     output_box.tag_configure("speaker", font=("Menlo", 13, "bold"))
 
-    ui_entries = []
-    ui_indexes = {}
+    edit = {"active": False, "snapshot": []}
     vocabulary = {"id": 0, "window": None, "tree": None, "items": []}
     participants = {"window": None}
 
@@ -1398,12 +1576,14 @@ def build_ui():
         refresh_vocabulary()
 
     def render_entries():
+        if edit["active"]:
+            return
         for box in (input_box, output_box):
             box.configure(state="normal")
             box.delete("1.0", "end")
 
         displayed_speaker = ""
-        for index, entry in enumerate(ui_entries):
+        for index, entry in enumerate(state["entries"]):
             if entry["speaker"]:
                 if index:
                     input_box.insert("end", "\n")
@@ -1427,6 +1607,84 @@ def build_ui():
             box.see("end")
             box.configure(state="disabled")
 
+    def toggle_editing():
+        if edit["active"]:
+            apply_edits()
+            return
+
+        render_entries()
+        edit["active"] = True
+        edit["snapshot"] = [dict(entry) for entry in state["entries"]]
+        input_box.configure(state="normal")
+        input_box.focus_set()
+        input_box.mark_set("insert", "end-1c")
+        edit_button.configure(text="Apply edits")
+        status_var.set(
+            "Uprav text a klikni Apply edits. Nový text z OCR sa doplní po použití úprav."
+        )
+
+    def commit_edits():
+        """Apply pending edit-mode text; Stop retranslates the returned ids itself."""
+        if not edit["active"]:
+            return set()
+        return apply_edits(translate=False)
+
+    def apply_edits(translate=True):
+        text = input_box.get("1.0", "end")
+        try:
+            entries, changed_ids = apply_edited_entries(
+                text, tuple(state["names"]), edit["snapshot"]
+            )
+        except Exception as exc:
+            status_var.set("Úpravy sa nepodarilo použiť.")
+            messagebox.showerror("Úpravy transcriptu", str(exc))
+            return set()
+
+        # Lines scanned while the panel was being edited are not part of the text; keep them.
+        snapshot_by_id = {entry["id"]: entry for entry in edit["snapshot"]}
+        live_by_id = {entry["id"]: entry for entry in state["entries"]}
+        for entry in entries:
+            live = live_by_id.get(entry["id"])
+            snapshot = snapshot_by_id.get(entry["id"])
+            if live is None or snapshot is None or entry["speaker"]:
+                continue
+            if comparable_line(entry["source"]) == comparable_line(snapshot["source"]):
+                # Untouched line: OCR may have extended it meanwhile, so the live version wins.
+                entry["source"] = live["source"]
+                entry["translation"] = live.get("translation", "")
+        edited_ids = {entry["id"] for entry in entries}
+        entries.extend(
+            entry
+            for entry in state["entries"]
+            if entry["id"] not in edited_ids and entry["id"] not in snapshot_by_id
+        )
+        state["entries"][:] = entries
+        state["active_entry_id"] = None
+        state["revision_entry_id"] = None
+        state["current_speaker"] = entries[-1]["context"] if entries else ""
+        edit["snapshot"] = []
+        edit["active"] = False
+        edit_button.configure(text="Edit text")
+        render_entries()
+
+        try:
+            saved = resave_transcript()
+        except Exception as exc:
+            status_var.set("Úpravy použité, uloženie zlyhalo.")
+            messagebox.showerror("Uloženie úprav", str(exc))
+            return changed_ids
+
+        if changed_ids and translate:
+            status_var.set("Upravované riadky prekladám...")
+            retranslate_entries(changed_ids)
+        elif changed_ids:
+            status_var.set(
+                "Úpravy uložené, preklad doplním po Stop." if saved else "Úpravy použité."
+            )
+        else:
+            status_var.set("Úpravy uložené." if saved else "Úpravy použité.")
+        return changed_ids
+
     def process_events():
         try:
             while True:
@@ -1434,23 +1692,28 @@ def build_ui():
                 if event[0] == "status":
                     status_var.set(event[1])
                 elif event[0] == "reset":
-                    ui_entries.clear()
-                    ui_indexes.clear()
                     render_entries()
                 elif event[0] == "upsert":
                     entry_id, source, translation, speaker, context = event[1:]
-                    entry = {
-                        "id": entry_id,
-                        "source": source,
-                        "translation": translation,
-                        "speaker": speaker,
-                        "context": context,
-                    }
-                    if entry_id in ui_indexes:
-                        ui_entries[ui_indexes[entry_id]] = entry
+                    for current in state["entries"]:
+                        if current["id"] == entry_id:
+                            current.update(
+                                source=source,
+                                translation=translation,
+                                speaker=speaker,
+                                context=context,
+                            )
+                            break
                     else:
-                        ui_indexes[entry_id] = len(ui_entries)
-                        ui_entries.append(entry)
+                        state["entries"].append(
+                            {
+                                "id": entry_id,
+                                "source": source,
+                                "translation": translation,
+                                "speaker": speaker,
+                                "context": context,
+                            }
+                        )
                     render_entries()
                 elif event[0] == "error":
                     status_var.set("Chyba")
@@ -1485,6 +1748,10 @@ def build_ui():
     def close():
         state["running"] = False
         try:
+            commit_edits()
+        except Exception as exc:
+            messagebox.showerror("Úpravy transcriptu", str(exc))
+        try:
             save_pending_names()
         except Exception as exc:
             messagebox.showerror("Uloženie účastníkov", str(exc))
@@ -1492,6 +1759,10 @@ def build_ui():
             save_current_transcript()
         except Exception as exc:
             messagebox.showerror("Uloženie transcriptu", str(exc))
+        try:
+            resave_transcript()
+        except Exception as exc:
+            messagebox.showerror("Uloženie úprav", str(exc))
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", close)

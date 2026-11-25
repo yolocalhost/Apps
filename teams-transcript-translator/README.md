@@ -32,8 +32,19 @@ Set `TEAMS_TRANSLATOR_MODEL_PATH` before starting the app to use a different mod
 6. When OCR is stopped, click `Learn words` to see the most frequent transcript words and their Slovak translations. This is available when the app opens, so you can choose an older saved session before starting a new scan. Common helper words, names, and words already marked as known are omitted.
 7. In `Session words`, choose `Aktuálna session` or an older saved transcript, select the input language, and click `Už viem` after selecting words you already know. The known-word list is stored locally in `known_words.txt` and is reused in future sessions. Completed vocabulary translations are cached in `vocabulary_translations.txt`, so refreshing the list does not translate the same word again.
 8. Click `Transcripts` to open the `transcripts` folder in Finder for quick navigation to saved sessions.
+9. Click `Edit text` to correct OCR mistakes in the left panel, then `Apply edits` to keep them.
 
-After clicking `Stop`, the current transcript is saved automatically as two UTF-8 text files: one original and one Slovak translation. Each new OCR session is saved to a new file pair under `transcripts/YYYY/MM/DD/` with a time-based filename. If the app is closed while OCR is running, the current transcript is saved then as well.
+After clicking `Stop`, the current transcript is saved automatically as two UTF-8 text files: one original and one Slovak translation. Each `Start` begins a new transcript: it clears the previous one and `Stop` writes a new file pair under `transcripts/YYYY/MM/DD/` with a time-based filename, so a later session never appends to or continues an earlier file. If the app is closed while OCR is running, the current transcript is saved then as well.
+
+### Editing the transcript
+
+`Edit text` makes the `OCR vstup` panel editable and pauses live refresh, so OCR updates no longer overwrite what you type. Correct the words that OCR misread and click `Apply edits`.
+
+- The text is read back into phrases. A line that matches a participant name stays a speaker heading, so keep headings on their own line; phrase lines are rendered indented by two spaces and that indentation protects speaker-like text inside a sentence.
+- Unchanged lines keep their existing Slovak translation. Edited or newly typed lines are retranslated in the background and the panel updates when the model finishes.
+- Lines deleted in the panel disappear from the files. Text scanned while you were editing is appended after your corrections.
+- Applying edits after `Stop` rewrites the same `_original.txt` and `_translation.txt` pair instead of creating a new one. Pressing `Stop` while editing applies the pending text first.
+- Meeting notes are generated from the corrected original when `Stop` saves a new file. Notes are not regenerated for edits applied after `Stop`; rerun `python3 meeting_notes.py --force <transcript>_original.txt` when you want them refreshed.
 
 The `English` and `German` input selector can be changed while OCR is running. The next screen scan uses the selected language.
 
